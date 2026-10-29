@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+.coverage
+htmlcov/
+build/
+dist/
+
+# Toner runtime state (created inside the target project)
+.toner/*
+!.toner/audit/
+!.toner/audit/**
+
+# Local secrets and editor files
+.env
+.env.*
+!.env.example
+*.log
+.DS_Store
