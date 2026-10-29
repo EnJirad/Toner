@@ -1,0 +1,46 @@
+
+{
+  "api_url": "https://aiunlimit.thirx.com/api/v1/chat/completions",
+  "api_key": "",
+  "model": "rb/gpt-6-luna",
+
+  "project_root": "/storage/emulated/0/VNE/Vel/velnox",
+  "state_directory": ".toner",
+
+  "max_tool_rounds": 50,
+  "request_timeout": 120,
+  "command_timeout": 180,
+  "max_file_bytes": 100000,
+  "max_search_results": 50,
+  "max_auto_steps_per_session": 10,
+  "max_plan_files": 100,
+  "max_plan_tasks": 30,
+  "max_context_chars": 24000,
+
+  "require_approval_for_writes": false,
+  "require_approval_for_commands": false,
+  "require_approval_for_deletions": true,
+  "allow_file_deletion": true,
+
+  "load_project_rules": true,
+  "project_rule_files": [
+    ".ai/AI_RULES.md",
+    ".ai/AI_HANDOFF.md",
+    ".ai/README.md",
+    "AGENTS.md"
+  ],
+
+  "ignored_directories": [
+    ".git",
+    "node_modules",
+    ".next",
+    "dist",
+    "build",
+    "coverage",
+    ".venv",
+    "venv",
+    "__pycache__",
+    ".turbo",
+    ".cache"
+  ]
+}
