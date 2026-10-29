@@ -1,8 +1,11 @@
 """Toner — reusable AI coding agent and software factory.
 
 This entry point only loads configuration, wires the services and dispatches
-CLI commands. Orchestration lives in ``core.orchestrator``; tools, state and
-policy live in their own packages.
+input. Slash commands are handled here; everything else is natural language
+and goes to the intent router in ``core.orchestrator`` (chat, questions,
+inspection, planning, coding tasks, tests and Git requests). Orchestration
+lives in ``core.orchestrator``; tools, state and policy live in their own
+packages.
 """
 
 from __future__ import annotations
@@ -20,19 +23,27 @@ from tools.registry import ToolRegistry
 HELP = """
 Toner commands
 
-/check   Read .toner/new_command.md and run it as one ad-hoc task
-/auto    Read .toner/files_md/*.md, plan tasks, then build/review/test/verify
+/help    Show this help
 /status  Show the run, task states, attempts, commits and test totals
+/check   Read .toner/new_command.md (or /check <text>) and run it ad-hoc
+/auto    Read .toner/files_md/*.md, plan tasks, then build/review/test/verify
 /resume  Validate saved state, show recovery details and continue safely
 /report  Write an evidence-based Markdown engineering report
-/help    Show this help
-/exit    Exit Toner
+/stop    Safely cancel the active task and save its state
+/exit    Exit Toner (/quit also works)
+
+Anything else is conversation, not a command:
+- "hi", "สวัสดี" — normal chat
+- "ทำไม build ไม่ผ่าน" — diagnosis with read-only inspection
+- "ช่วยแก้บั๊กนี้" — a tracked coding task
+- "ตรวจสอบโปรเจกต์ให้หน่อย" — inspect without changing files
+- "รัน python3 -m unittest" — run an allowlisted check
 
 Workflow
 1. Set project_root in settings.json (or TONER_PROJECT_ROOT).
 2. Provide AIUNLIMIT_API_KEY in the environment.
-3. Put plan Markdown in <project>/.toner/files_md/.
-4. Use /auto for the plan, or /check for a single command.
+3. Put plan Markdown in <project>/.toner/files_md/ for /auto.
+4. Or just type what you want in plain language.
 
 A task is only marked DONE after the Verifier accepts executed tests, the
 review verdict and every machine-checkable acceptance criterion. Evidence is
@@ -52,11 +63,59 @@ def _banner(settings, orchestrator):
     if not settings.get("api_key"):
         print(
             "\n⚠️ No API key configured. Local commands (/status, /resume, "
-            "/report) work; model actions will fail until AIUNLIMIT_API_KEY "
-            "is set."
+            "/report) work; chat and model actions will fail until "
+            "AIUNLIMIT_API_KEY is set."
         )
 
-    print("Type /help for commands.\n")
+    print("Type /help for commands, or just talk to Toner.\n")
+
+
+def _dispatch(orchestrator, bus, line):
+    """Handle one line of input; return True when Toner should exit."""
+    if not line.startswith("/"):
+        try:
+            orchestrator.handle(line)
+        except KeyboardInterrupt:
+            request_stop()
+            print("\nStop requested; saving state after the current step.")
+        except Exception as exc:
+            if bus is not None:
+                bus.emit("agent.error", phase="chat", error=str(exc))
+            print(f"Error: {exc}")
+        return False
+
+    name = line.split()[0].lower()
+    argument = line[len(name) :].strip()
+    lowered = line.lower()
+
+    try:
+        if lowered in ("/exit", "/quit"):
+            return True
+        if name == "/help":
+            print(HELP)
+        elif name == "/status":
+            orchestrator.status()
+        elif name == "/check":
+            orchestrator.check(prompt=argument or None)
+        elif name == "/auto":
+            orchestrator.auto()
+        elif name == "/resume":
+            orchestrator.resume()
+        elif name == "/report":
+            orchestrator.report()
+        elif name == "/stop":
+            orchestrator.stop()
+        else:
+            print(f"Unknown command: {name}. Type /help for the list.")
+    except KeyboardInterrupt:
+        request_stop()
+        print("\nStop requested; saving state after the current step.")
+    except Exception as exc:
+        if bus is not None:
+            bus.emit("agent.error", phase="cli", error=str(exc))
+        print(f"Error: {exc}")
+
+    return False
 
 
 def main():
@@ -64,7 +123,6 @@ def main():
     reset_stop()
     orchestrator = None
     bus = None
-    exit_code = 0
 
     try:
         settings = load_settings()
@@ -84,42 +142,28 @@ def main():
     _banner(settings, orchestrator)
 
     try:
-        while not stop_requested():
+        while True:
             try:
-                command = input("Toner > ").strip()
+                line = input("Toner > ").strip()
             except (EOFError, KeyboardInterrupt):
                 print("\nExiting Toner.")
                 break
 
-            if not command:
+            if stop_requested():
+                # Ctrl+C at the prompt: the user asked to quit.
+                print("\nStop requested; shutting down.")
+                break
+
+            if not line:
                 continue
 
-            lowered = command.lower()
+            reset_stop()
 
-            try:
-                if lowered in ("/exit", "exit", "quit"):
-                    break
-                if lowered == "/help":
-                    print(HELP)
-                elif lowered == "/status":
-                    orchestrator.status()
-                elif lowered == "/check":
-                    orchestrator.check()
-                elif lowered == "/auto":
-                    orchestrator.auto()
-                elif lowered == "/resume":
-                    orchestrator.resume()
-                elif lowered == "/report":
-                    orchestrator.report()
-                else:
-                    orchestrator.check(prompt=command)
-            except KeyboardInterrupt:
-                request_stop()
-                print("\nStop requested; saving state after the current step.")
-            except Exception as exc:
-                if bus is not None:
-                    bus.emit("agent.error", phase="cli", error=str(exc))
-                print(f"Error: {exc}")
+            if _dispatch(orchestrator, bus, line):
+                break
+
+            # An operation cancelled mid-run must leave the session usable.
+            reset_stop()
     finally:
         try:
             orchestrator.shutdown()
@@ -130,7 +174,7 @@ def main():
             bus.emit("agent.shutdown")
 
     print("Toner closed.")
-    return exit_code
+    return 0
 
 
 if __name__ == "__main__":

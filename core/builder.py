@@ -2,7 +2,9 @@
 
 The Builder reports what it did. It cannot mark a task DONE, it cannot commit,
 and its claims are checked against the real filesystem and Git state by the
-Verifier.
+Verifier. The tool-calling loop itself lives in :mod:`core.agent_loop`; this
+module only supplies the prompts and turns the loop result into a
+:class:`BuildResult`.
 """
 
 from __future__ import annotations
@@ -12,9 +14,9 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from core.agent_loop import AgentLoop
 from core.context_manager import ContextManager
-from core.interrupts import stop_requested
-from core.textutil import extract_json_object, json_dumps, truncate_middle
+from core.textutil import extract_json_object
 
 GLOBAL_RULE_FILE = Path(__file__).resolve().parent.parent / "toner_rule.md"
 
@@ -36,6 +38,7 @@ class BuildResult:
     files_changed: list = field(default_factory=list)
     new_changes: list = field(default_factory=list)
     pre_existing_changes: list = field(default_factory=list)
+    touched_files: list = field(default_factory=list)
     checks_run: list = field(default_factory=list)
     policy_violations: list = field(default_factory=list)
     tool_calls: int = 0
@@ -170,137 +173,77 @@ Requirements:
     def build(self, task, run_id=""):
         started = time.monotonic()
         before_files = set(self._changed_files())
-        messages = [
-            {"role": "system", "content": self.system_prompt()},
-            {"role": "user", "content": self.task_prompt(task)},
-        ]
-
-        max_rounds = max(1, int(self.settings.get("max_tool_rounds", 50)))
-        tool_calls = 0
-        touched_files = set()
-        checks_run = []
-        violations = []
-        context_events = []
-        final_text = ""
-        rounds = 0
-        stopped = False
 
         if self.bus is not None:
             self.bus.emit("build.started", task_id=task.id, run_id=run_id)
 
-        for round_number in range(1, max_rounds + 1):
-            rounds = round_number
+        loop = AgentLoop(
+            self.settings,
+            self.router,
+            self.registry,
+            bus=self.bus,
+            context=self.context,
+            redactor=self.redactor,
+        )
+        result = loop.run(
+            system=self.system_prompt(),
+            prompt=self.task_prompt(task),
+            role="builder",
+        )
 
-            if stop_requested():
-                stopped = True
-                break
+        checks_run = []
+        touched_files = set()
 
-            message = self.router.chat(
-                "builder",
-                messages,
-                tools=self.registry.schemas,
-                temperature=0.1,
-            )
+        if result.status == "failed" and result.exception is not None:
+            # Preserve model-error classification (transient vs permanent)
+            # for the failure manager.
+            raise result.exception
 
-            assistant_message = {
-                "role": "assistant",
-                "content": message.get("content"),
-            }
+        for entry in result.tool_log:
+            name = entry.get("name", "")
+            payload = entry.get("result")
+            arguments = entry.get("arguments") or {}
 
-            if message.get("tool_calls"):
-                assistant_message["tool_calls"] = message["tool_calls"]
-
-            messages.append(assistant_message)
-            calls = message.get("tool_calls") or []
-
-            if not calls:
-                final_text = message.get("content") or ""
-                break
-
-            for call in calls:
-                if stop_requested():
-                    stopped = True
-                    break
-
-                function = call.get("function") or {}
-                name = function.get("name", "")
-
-                try:
-                    arguments = json.loads(function.get("arguments") or "{}")
-                except ValueError:
-                    arguments = None
-
-                if not isinstance(arguments, dict):
-                    result = {
-                        "error": "Tool arguments were not a JSON object",
-                        "code": "invalid_arguments",
-                    }
-                else:
-                    result = self.registry.execute(name, arguments)
-
-                tool_calls += 1
-
-                if name == "run_command" and isinstance(result, dict):
-                    checks_run.append(
-                        {
-                            "command": (arguments or {}).get("command", ""),
-                            "returncode": result.get("returncode"),
-                            "timed_out": bool(result.get("timed_out")),
-                            "duration": result.get("duration"),
-                            "error": result.get("error", ""),
-                        }
-                    )
-
-                if isinstance(result, dict) and result.get("success"):
-                    touched = result.get("path") or result.get("deleted")
-
-                    if touched:
-                        touched_files.add(str(touched))
-
-                code = result.get("code") if isinstance(result, dict) else None
-
-                if code in POLICY_VIOLATION_CODES:
-                    violations.append(
-                        {
-                            "tool": name,
-                            "code": code,
-                            "error": result.get("error", ""),
-                        }
-                    )
-
-                messages.append(
+            if name == "run_command" and isinstance(payload, dict):
+                checks_run.append(
                     {
-                        "role": "tool",
-                        "tool_call_id": call.get("id", ""),
-                        "content": truncate_middle(
-                            self.redactor.redact(json_dumps(result)),
-                            8000,
-                        ),
+                        "command": arguments.get("command", ""),
+                        "returncode": payload.get("returncode"),
+                        "timed_out": bool(payload.get("timed_out")),
+                        "duration": payload.get("duration"),
+                        "error": payload.get("error", ""),
                     }
                 )
 
-            messages, info = self.context.compact(messages, role="planner")
+            if isinstance(payload, dict) and payload.get("success"):
+                touched = payload.get("path") or payload.get("deleted")
 
-            if info.get("compacted"):
-                context_events.append(info)
+                if touched:
+                    touched_files.add(str(touched))
 
-            if stopped:
-                break
+        violations = [
+            item
+            for item in result.violations
+            if item.get("code") in POLICY_VIOLATION_CODES
+        ]
 
         after_files = set(self._changed_files()) | touched_files
         files_changed = sorted(after_files)
         new_changes = sorted(after_files - before_files)
-        summary, claimed_status = self._parse_final(final_text)
+        summary, claimed_status = self._parse_final(result.final_text)
 
-        if stopped:
+        if result.status == "stopped":
             status = "stopped"
             error = "Stopped by user request."
+        elif result.status == "failed" and not result.final_text:
+            status = "failed"
+            error = result.error or "The model call failed."
         elif violations:
             status = "failed"
             error = "Policy violation during build: " + "; ".join(
                 sorted({item["code"] for item in violations})
             )
-        elif not final_text and tool_calls == 0:
+        elif not result.final_text and result.tool_calls == 0:
             status = "failed"
             error = "The builder produced no tool calls and no final response."
         elif claimed_status == "blocked":
@@ -310,18 +253,19 @@ Requirements:
             status = "implemented"
             error = ""
 
-        result = BuildResult(
+        build = BuildResult(
             status=status,
-            summary=self.redactor.redact(summary or final_text.strip()),
+            summary=self.redactor.redact(summary or result.final_text.strip()),
             files_changed=files_changed,
             new_changes=new_changes,
             pre_existing_changes=sorted(before_files),
+            touched_files=sorted(touched_files),
             checks_run=checks_run,
             policy_violations=violations,
-            tool_calls=tool_calls,
-            rounds=rounds,
+            tool_calls=result.tool_calls,
+            rounds=result.rounds,
             error=error,
-            context_events=context_events,
+            context_events=result.context_events,
             duration=round(time.monotonic() - started, 3),
         )
 
@@ -329,13 +273,13 @@ Requirements:
             self.bus.emit(
                 "build.completed",
                 task_id=task.id,
-                status=result.status,
-                tool_calls=tool_calls,
-                files_changed=len(files_changed),
-                duration=result.duration,
+                status=build.status,
+                tool_calls=build.tool_calls,
+                files_changed=len(build.files_changed),
+                duration=build.duration,
             )
 
-        return result
+        return build
 
     @staticmethod
     def _parse_final(text):

@@ -14,13 +14,28 @@ Planner → Task ledger → Builder → Reviewer → QA → Verifier → Evidenc
                                                    Checkpoint → Commit → DONE
 ```
 
+## Two ways to use Toner
+
+**Conversation.** Type normally. Every message is classified before anything
+runs, so `hi` or `สวัสดี` gets a reply instead of starting a build, and
+`ทำไม build ไม่ผ่าน` triggers read-only diagnosis with the user's language
+preserved.
+
+**Coding tasks.** A request to create, fix, refactor or implement something
+starts a tracked task: baseline snapshot, inspected files, minimal edits, real
+checks, and a report of exactly what changed and what was verified.
+
+Neither needs a slash command. Slash commands are only for explicit control.
+
 ## Requirements
 
 - Python 3.10 or newer
 - `requests` (only needed for model calls; `/status`, `/resume` and `/report`
   work without it)
 - An API endpoint compatible with the Chat Completions API
-- A model/provider that supports tool calling
+- A model/provider that supports tool calling. Providers that ignore the
+  `tools` parameter still work through the validated fenced-block protocol
+  described below
 - Git is recommended (not required) for diffs, checkpoints and commits
 
 ## Installation on Termux
@@ -98,15 +113,71 @@ python toner.py
 
 ## Commands
 
-- `/check` — read `.toner/new_command.md` and run it as one ad-hoc task
+Slash commands are control commands only. Any other line is natural language
+and goes to the intent router — it is never turned into a command just because
+it lacks a leading `/`.
+
+- `/help` — commands, workflow and routing examples
+- `/status` — run, task states, attempts, model, project root, last error, totals
+- `/check [text]` — read `.toner/new_command.md` (or use the given text) and run
+  it as one ad-hoc task. Ad-hoc by design: not evidence-gated, so use `/auto`
+  for verified work
 - `/auto` — read `.toner/files_md/*.md`, plan tasks, then build/review/test/verify
-- `/status` — show the run, tasks, attempts, last error, commits and test totals
 - `/resume` — validate saved state, show recovery details and continue safely
 - `/report` — write an evidence-based Markdown engineering report
-- `/help` — show help
-- `/exit` — exit
+- `/stop` — request cancellation of the active task; the current step finishes,
+  state is saved, and no further step starts
+- `/exit`, `/quit` — exit cleanly
 
-Plain text is treated as an ad-hoc command, as before.
+## How conversation routing works
+
+`core/intent.py` classifies every non-command message into one category. It is
+pure logic (no terminal, no filesystem, no tools) and therefore unit testable
+in isolation. Routing is a hybrid:
+
+1. a deterministic fast path for greetings, pleasantries and follow-ups,
+2. model-based classification when a model is reachable — this is what handles
+   requests no keyword list would anticipate,
+3. a keyword heuristic when no model is configured or the call fails.
+
+| Intent | What Toner does |
+| --- | --- |
+| `CHAT` | Replies conversationally with history. No tools, no Git, no files, no evidence |
+| `QUESTION` | Read-only inspection (read/search/list only) then explains the finding |
+| `INSPECT` | Same read-only loop; explicitly diagnoses without editing |
+| `PLAN` | Produces a plan and states that no files were changed |
+| `CODE_TASK` | Starts a tracked task through build/review/QA/verification |
+| `TEST` | Runs the allowlisted command from the message and/or `test_command` |
+| `GIT_TASK` | Read-only Git inspection (status, log, diff, branch) |
+| `CLARIFICATION` | Asks one concise question instead of guessing |
+
+Follow-ups such as `ทำต่อ`, `แก้ต่อเลย` and `ทดสอบอีกครั้ง` reuse the active
+task context; when there is no unfinished task they say so instead of inventing
+work. `CHAT`/`INSPECT`/`PLAN` can never write files or run commands: the agent
+loop is restricted to an explicit read-only tool allowlist, and a write attempt
+is refused and recorded.
+
+## How the agent loop works
+
+`core/agent_loop.py` is the single controlled loop used by the Builder and by
+inspection. Each round sends the tool schemas, receives one or more calls,
+executes them through the Tool Registry, and feeds the real results back.
+
+Tool calls are accepted in exactly two validated formats:
+
+1. **Native** — Chat-Completions `tool_calls` on the assistant message.
+2. **Text protocol** — providers that ignore `tools` emit a fenced block:
+
+   ```tool_call
+   {"name": "read_file", "arguments": {"path": "app.py"}}
+   ```
+
+Both are validated against the registry schema (unknown tool, wrong type,
+missing argument and path violations are rejected and reported). Prose that
+merely *describes* a tool never becomes a call, so Toner cannot claim a tool ran
+when only text was produced. The loop enforces `max_tool_rounds`, request and
+command timeouts, a repeated-identical-call guard, and cooperative cancellation
+(`/stop` or Ctrl+C).
 
 ## How `/auto` works
 
@@ -126,8 +197,32 @@ Plain text is treated as an ad-hoc command, as before.
    review, and every machine-checkable criterion. Otherwise the task is retried
    or blocked. Only the Verifier can authorize `DONE`.
 8. Evidence is written to `.toner/evidence/<task>/` (`build.json`, `diff.json`,
-   `review.json`, `tests.json`, `verification.json`, plus attempt snapshots).
+   `review.json`, `tests.json`, `verification.json`, `changes.json`, plus
+   attempt snapshots).
 9. Checkpoints record the Git SHA and task state before and after risky work.
+
+### Change attribution
+
+Before a task starts, Toner captures a baseline: `git status --porcelain` plus
+the set of already-dirty and untracked paths. After the task it compares that
+baseline with the final status and the file writes the tools actually performed,
+then reports four separate buckets:
+
+- **Changed by this task** — new or modified paths Toner's own tools touched
+- **Pre-existing changes** — dirty before the task, not touched by it
+- **Untracked files that existed before this task** — never claimed as output
+- **Unattributed** — differences no tool can be proven to have caused (for
+  example a shell command or another process)
+
+Files dirty before the task are listed separately again when Toner also changed
+them. Pre-existing content is never discarded, and no path is ever reported as
+"changed by this task" on the strength of `git status` alone. If Git is
+unavailable, attribution falls back to observed tool writes only and the report
+states that limitation explicitly.
+
+Checks are reported with mutually exclusive counts: executed, passed, failed,
+skipped, and not run. A skipped or missing check is never counted as a pass and
+never satisfies verification.
 
 ### Retries and blocking
 
@@ -219,6 +314,16 @@ Coverage includes unit tests, golden safety/tool-contract tests and integration
 tests for the full pipeline, blocking, commits, resume, planning and the CLI.
 No test requires network access; model calls are scripted.
 
+The current suite has 190 tests. Routing and conversation coverage lives in
+`tests/unit/test_intent.py`, `tests/unit/test_toolcall.py`,
+`tests/unit/test_agent_loop.py`, `tests/unit/test_baseline.py` and
+`tests/integration/test_conversation.py`. The integration suite drives
+`Orchestrator.handle()` exactly as the CLI does and asserts that greetings run
+no tools or evidence, inspection cannot write files, pre-existing user changes
+are not attributed to the task, unexecuted checks are never reported as
+passing, cancellation stops further work, and API/tool-format errors are
+reported instead of crashing.
+
 ## Troubleshooting
 
 ### API authentication error
@@ -248,4 +353,14 @@ is never retried forever.
 - `/check` is an ad-hoc build and is **not** evidence-gated; use `/auto` for
   verified work.
 - Git is optional, but without it Toner cannot produce a reviewable diff or
-  commits.
+  commits, and change attribution falls back to observed tool writes only.
+- Conversation (`CHAT`) is intentionally toolless, and `QUESTION`/`INSPECT`
+  are restricted to read-only tools. Asking a question will not silently edit
+  the project — say "fix it" to start a task.
+- `TEST` only executes commands the security policy allowlists. Anything else
+  is refused with an explanation; Toner will not run arbitrary shell lines just
+  because they were typed.
+- The text tool protocol is fully validated, but providers vary in how
+  reliably they emit it. Native tool calling is always preferred.
+- Everything in this repository is verified with scripted model responses on
+  Linux/Python 3.10. No test in this environment used a live provider key.

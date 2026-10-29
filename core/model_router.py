@@ -128,7 +128,16 @@ class OpenAICompatibleProvider(ModelProvider):
 class ModelRouter:
     """Resolve a provider and model per role."""
 
-    ROLES = ("planner", "builder", "reviewer", "qa", "verifier")
+    ROLES = (
+        "planner",
+        "builder",
+        "reviewer",
+        "qa",
+        "verifier",
+        "chat",
+        "router",
+        "inspector",
+    )
 
     def __init__(self, settings, provider=None):
         self.settings = settings

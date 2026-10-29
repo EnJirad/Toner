@@ -75,6 +75,10 @@ class GitTools:
     def log(self, limit=10):
         return self._run(["log", f"-{max(1, int(limit))}", "--oneline"])
 
+    def porcelain(self):
+        """Raw ``git status --porcelain`` for baseline/change attribution."""
+        return self._run(["status", "--porcelain"])
+
     def changed_files(self):
         """Return currently changed paths (staged, unstaged and untracked)."""
         result = self._run(["status", "--porcelain"])

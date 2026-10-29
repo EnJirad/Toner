@@ -249,6 +249,13 @@ class TaskRunner:
                 "failed": len(
                     [item for item in qa_result.results if item.status == "failed"]
                 ),
+                "skipped": len(
+                    [
+                        item
+                        for item in qa_result.results
+                        if item.status == "skipped"
+                    ]
+                ),
                 "executed": qa_result.executed,
                 "commands": qa_result.commands,
             }
